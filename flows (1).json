@@ -1,0 +1,236 @@
+[
+    {
+        "id": "d64a5a1a57b78584",
+        "type": "tab",
+        "label": "Flow 1",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "c457c423886f505f",
+        "type": "mqtt-broker",
+        "name": "",
+        "broker": "localhost",
+        "port": 1883,
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "2a187b38a24d39be",
+        "type": "mqtt in",
+        "z": "d64a5a1a57b78584",
+        "name": "batteria",
+        "topic": "ev/rifornimento",
+        "qos": "2",
+        "datatype": "auto-detect",
+        "broker": "c457c423886f505f",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 190,
+        "y": 200,
+        "wires": [
+            [
+                "b4f65e42b8b0f834",
+                "6546caaee5f68f74"
+            ]
+        ]
+    },
+    {
+        "id": "433346f65c5952a5",
+        "type": "mqtt out",
+        "z": "d64a5a1a57b78584",
+        "name": "",
+        "topic": "ev/comandi",
+        "qos": "",
+        "retain": "",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "c457c423886f505f",
+        "x": 530,
+        "y": 220,
+        "wires": []
+    },
+    {
+        "id": "b96e98f715948297",
+        "type": "inject",
+        "z": "d64a5a1a57b78584",
+        "name": "",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 380,
+        "y": 280,
+        "wires": [
+            [
+                "433346f65c5952a5"
+            ]
+        ]
+    },
+    {
+        "id": "b4f65e42b8b0f834",
+        "type": "debug",
+        "z": "d64a5a1a57b78584",
+        "name": "play",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 210,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "578b869837bdd961",
+        "type": "mqtt in",
+        "z": "d64a5a1a57b78584",
+        "name": "telemetria",
+        "topic": "ev/stazione",
+        "qos": "2",
+        "datatype": "auto-detect",
+        "broker": "c457c423886f505f",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 80,
+        "y": 80,
+        "wires": [
+            [
+                "fb34bc529a3958cf"
+            ]
+        ]
+    },
+    {
+        "id": "d5d32906f8dd0b44",
+        "type": "mqtt in",
+        "z": "d64a5a1a57b78584",
+        "name": "dati server",
+        "topic": "ev/stazione/server",
+        "qos": "2",
+        "datatype": "auto-detect",
+        "broker": "c457c423886f505f",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 620,
+        "y": 100,
+        "wires": [
+            [
+                "6546caaee5f68f74"
+            ]
+        ]
+    },
+    {
+        "id": "fb34bc529a3958cf",
+        "type": "json",
+        "z": "d64a5a1a57b78584",
+        "name": "dati_colonnine",
+        "property": "payload",
+        "action": "",
+        "pretty": false,
+        "x": 240,
+        "y": 140,
+        "wires": [
+            [
+                "433346f65c5952a5",
+                "e24d4d30127b481f"
+            ]
+        ]
+    },
+    {
+        "id": "6546caaee5f68f74",
+        "type": "json",
+        "z": "d64a5a1a57b78584",
+        "name": "stato_stazione",
+        "property": "payload",
+        "action": "",
+        "pretty": false,
+        "x": 520,
+        "y": 180,
+        "wires": [
+            [
+                "19014a8e6813807a"
+            ]
+        ]
+    },
+    {
+        "id": "e24d4d30127b481f",
+        "type": "debug",
+        "z": "d64a5a1a57b78584",
+        "name": "play telemetria",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 400,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "19014a8e6813807a",
+        "type": "debug",
+        "z": "d64a5a1a57b78584",
+        "name": "play dati_server",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 820,
+        "y": 160,
+        "wires": []
+    }
+]
