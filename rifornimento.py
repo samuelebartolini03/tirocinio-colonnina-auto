@@ -130,35 +130,68 @@ class Colonnina:
         return round((self.soc_kwh / self.capacita) * 100, 1)
 
     def leggi_parametri(self):
-        if self.stato != "OCCUPATA":
-            return {
-                "id": self.id,
-                "stato": "LIBERA",
-                "veicolo": None,
-                "soc": 0,
-                "temperatura": self.s_temp.rileva(),  # Sensori attivi anche se non carica
-                "temperatura_esterna": self.s_temp_ext.rileva(),
-                "degrado": self.s_deg.rileva(),
-                "tensione": self.s_tens.rileva(),
-                "potenza_richiesta": 0
-            }
-        # Simula una richiesta di potenza basata sul veicolo
-        max_potenza_veicolo = VEICOLI[self.veicolo]["max_potenza"]
-        # Tende a richiedere il massimo all'inizio
-        potenza_richiesta = random.uniform(max_potenza_veicolo * 0.5, max_potenza_veicolo)
+        """
+        Legge i parametri della colonnina con analisi avanzata del sensore temperatura:
+        - Calcola temperatura predetta in base a potenza e raffreddamento
+        - Rileva anomalie (gap elevato)
+        - Rileva situazioni pericolose (gap alto + temperatura media alta)
+        - In caso di dubbio usa il valore più critico per sicurezza
+        """
+        t_esterna = self.s_temp_ext.rileva()
+        t_reale_sensore = self.s_temp.rileva()
+
+        # Calcolo della temperatura predetta (teorica)
+        if self.stato == "OCCUPATA":
+            max_p = VEICOLI[self.veicolo]["max_potenza"]
+            potenza_teorica = random.uniform(max_p * 0.5, max_p)
+            inc_teorico = (potenza_teorica / 10.0) * 2.0  # ~2°C ogni 10 kW
+            if self.raffreddamento_attivo:
+                inc_teorico *= 0.6  # effetto del raffreddamento locale
+            temp_predetta = t_esterna + inc_teorico
+        else:
+            temp_predetta = t_esterna + 1.0
+            potenza_teorica = 0
+
+        # Analisi scostamento (gap) e media temperatura
+        gap = abs(t_reale_sensore - temp_predetta)
+        soglia_anomalia = 15.0
+        soglia_media_pericolosa = 45.0  # se la media è alta + gap → situazione sospetta
+
+        media_temp = (t_reale_sensore + temp_predetta) / 2
+
+        anomalia = gap > soglia_anomalia
+        anomalia_pericolosa = anomalia and (media_temp > soglia_media_pericolosa)
+
+        diagnostica = "OK"
+        if anomalia:
+            diagnostica = f"ANOMALIA SENSORE: gap {gap:.1f}°C"
+            if anomalia_pericolosa:
+                diagnostica += f" – MEDIA ALTA {media_temp:.1f}°C → ATTENZIONE!"
+
+        # Strategia prudente: in caso di anomalia usiamo la temperatura più alta
+        if anomalia:
+            temperatura_output = max(t_reale_sensore, temp_predetta)
+        else:
+            temperatura_output = t_reale_sensore
 
         return {
             "id": self.id,
-            "veicolo": self.veicolo,
+            "veicolo": self.veicolo if self.stato == "OCCUPATA" else None,
             "stato": self.stato,
             "soc": self.soc_percento(),
-            "temperatura": self.s_temp.rileva(),
-            "temperatura_esterna": self.s_temp_ext.rileva(),
+            "temperatura": round(temperatura_output, 1),           # valore usato per decisioni di sicurezza
+            "temperatura_esterna": t_esterna,
+            "temperatura_predetta": round(temp_predetta, 1),
+            "temperatura_reale_grezzo": round(t_reale_sensore, 1),
+            "gap_rilevato": round(gap, 1),
+            "anomalia": anomalia,
+            "anomalia_pericolosa": anomalia_pericolosa,
+            "media_temperatura": round(media_temp, 1),
+            "diagnostica": diagnostica,
             "degrado": self.s_deg.rileva(),
             "tensione": self.s_tens.rileva(),
-            "potenza_richiesta": round(potenza_richiesta, 1)
+            "potenza_richiesta": round(potenza_teorica, 1)
         }
-
 
 # SERVER MULTI-COLONNINA con Logica Intelligente
 class StazioneServer:
@@ -168,46 +201,57 @@ class StazioneServer:
 
     def analizza_colonnina_singola(self, p):
         """
-        Metodo compatibile con la logica precedente (se volessimo analizzare singolarmente).
-        Manteniamo come fallback, ma ora useremo distribuisci_potenza per allocazione intelligente.
+        Analisi singola colonnina con gestione anomalie sensore temperatura.
         """
-        potenza_effettiva = p["potenza_richiesta"]
-        azioni = []
-
         if p["stato"] != "OCCUPATA":
             return ["LIBERA"], 0
 
+        potenza_effettiva = p["potenza_richiesta"]
+        azioni = []
         temp = p["temperatura"]
         veicolo = p["veicolo"]
 
+        # PRIORITÀ 1: Anomalia sensore pericolosa → STOP immediato
+        if p.get("anomalia_pericolosa", False):
+            azioni.append("FERMA: Anomalia sensore pericolosa")
+            azioni.append("(gap elevato + temperatura media alta)")
+            return azioni, 0.0
+
+        # PRIORITÀ 2: Modalità di stazione
         if CONFIG["modalita"] == "Eco":
             potenza_effettiva *= 0.75
-            azioni.append("MODALITA: Eco (-25%)")
+            azioni.append("MODALITÀ: Eco (-25%)")
         elif CONFIG["modalita"] == "Boost":
             potenza_effettiva *= 1.20
-            azioni.append("MODALITA: Boost (+20%)")
+            azioni.append("MODALITÀ: Boost (+20%)")
 
+        # PRIORITÀ 3: Limite massimo del veicolo
         if veicolo and potenza_effettiva > VEICOLI[veicolo]["max_potenza"]:
             potenza_effettiva = VEICOLI[veicolo]["max_potenza"]
             azioni.append("LIMITE: Veicolo Max")
 
+        # PRIORITÀ 4: Gestione temperatura (valore già "sicuro" da leggi_parametri)
         if temp is not None:
             if CONFIG["soglia_temp_alta"] < temp <= CONFIG["soglia_temp_critica"]:
                 potenza_effettiva *= (1 - CONFIG["percentuale_riduzione_temp_alta"])
-                azioni.append("RIDUCI: Temp Alta")
+                azioni.append(f"RIDUCI: Temp Alta (-{int(CONFIG['percentuale_riduzione_temp_alta'] * 100)}%)")
             elif temp > CONFIG["soglia_temp_critica"]:
                 potenza_effettiva = 0
                 azioni.append("FERMA: Temp Critica")
 
-        if p["degrado"] and p["degrado"] > CONFIG["soglia_degrado"]:
+        # PRIORITÀ 5: Degrado componenti
+        if p.get("degrado", 0) > CONFIG["soglia_degrado"]:
             potenza_effettiva = 0
             azioni.append("FERMA: Degrado Alto")
 
+        # Limite finale di sicurezza
         potenza_effettiva = max(0, min(potenza_effettiva, CONFIG["max_potenza"]))
+
+        # Se non ci sono azioni particolari, tutto ok
         if not azioni:
             azioni.append("OK")
-        return azioni, round(potenza_effettiva, 1)
 
+        return azioni, round(potenza_effettiva, 1)
     def distribuisci_potenza(self, lista_parametri):
         """
         Algoritmo intelligente di distribuzione della potenza:
@@ -379,6 +423,9 @@ def avvia_stazione(num_colonnine=4):
     colonnine = [Colonnina(i + 1) for i in range(num_colonnine)]
     server = StazioneServer()
 
+    # --- AGGIUNTA: Inizializzazione Counter Anomalie ---
+    counter_anomalie = 0
+
     cicli_simulati = 10
     print(f"\n Avvio simulazione per {cicli_simulati} cicli. {num_colonnine} colonnine.")
 
@@ -387,61 +434,51 @@ def avvia_stazione(num_colonnine=4):
 
         parametri_lista = []
 
-        # Prima raccogliamo i parametri (senza ancora applicare potenze)
+        # Raccogliamo i parametri (Include la logica di predizione nel metodo leggi_parametri)
         for col in colonnine:
             if col.stato == "LIBERA":
-                # La colonnina è libera e non c'è un'auto in attesa
-                # 40% probabilità che arrivi un'auto in questo ciclo
                 if random.random() < 0.4:
                     col.assegna_auto()
                 else:
                     print(f" Colonnina {col.id} è LIBERA e in attesa.")
-                    # Aggiungi parametri 'vuoti' per la telemetria anche se libera
                     parametri_lista.append(col.leggi_parametri())
-                    continue  # Passa alla prossima colonnina
+                    continue
 
             if col.stato == "COMPLETATA":
                 print(f" Colonnina {col.id} è stata liberata.")
                 col.stato = "LIBERA"
                 col.veicolo = None
                 col.raffreddamento_attivo = False
-                # Se è appena stata liberata, salta l'analisi e aspetta il prossimo ciclo
                 continue
 
             # Lettura Sensori e Richiesta Potenza
             p = col.leggi_parametri()
             parametri_lista.append(p)
 
-        # Ora applichiamo la logica intelligente di distribuzione della potenza
+        # Distribuzione intelligente della potenza
         parametri_con_potenza = server.distribuisci_potenza(list(parametri_lista))
 
-        # Applichiamo gli aggiornamenti alle colonnine reali e pubblichiamo
+        # Aggiornamento colonnine e pubblicazione
         for p in parametri_con_potenza:
-            # Trovo la colonnina corrispondente se esiste
             if p.get("stato") != "OCCUPATA":
-                # pubblica comunque i dati di colonnina libera
                 client.publish(f"ev/stazione/colonnina/{p['id']}", json.dumps(p))
                 continue
 
-            # Trova oggetto colonnina
             col = next((c for c in colonnine if c.id == p["id"]), None)
             if not col:
                 continue
 
-            # Applica azioni e potenza effettiva
             azioni = p.get("azioni", [])
             potenza_effettiva = p.get("potenza_effettiva", 0.0)
 
-            # segna raffreddamento locale se presente
             if p.get("raffreddamento"):
                 col.raffreddamento_attivo = True
             else:
                 col.raffreddamento_attivo = False
 
-            # Aggiornamento Carica (usa la potenza effettiva regolata!)
             col.aggiorna_soc(potenza_effettiva)
 
-            # Arricchiamo il payload con SoC aggiornato
+            # PAYLOAD COMPLETO: Uniamo i dati originali con quelli di diagnostica
             payload = {
                 "id": col.id,
                 "veicolo": col.veicolo,
@@ -449,6 +486,10 @@ def avvia_stazione(num_colonnine=4):
                 "soc": col.soc_percento(),
                 "temperatura": p.get("temperatura"),
                 "temperatura_esterna": p.get("temperatura_esterna"),
+                "temperatura_predetta": p.get("temperatura_predetta"), # Dalla predizione
+                "gap_rilevato": p.get("gap_rilevato"),                 # Differenza calcolata
+                "anomalia": p.get("anomalia"),                         # Flag vero/falso
+                "diagnostica": p.get("diagnostica"),                   # Messaggio testo
                 "degrado": p.get("degrado"),
                 "tensione": p.get("tensione"),
                 "potenza_richiesta": p.get("potenza_richiesta"),
@@ -457,14 +498,21 @@ def avvia_stazione(num_colonnine=4):
                 "raffreddamento_attivo": col.raffreddamento_attivo
             }
 
-            # Stampa un riepilogo per ciclo
-            print(
-                f"   Col. {col.id} ({payload['veicolo']}): SoC {payload['soc']}% | Potenza Eff. {payload['potenza_effettiva']} kW | Azioni: {', '.join(azioni)} | Temp: {payload['temperatura']}°C")
+            # AGGIUNTA: Incremento del counter se viene rilevata un'anomalia
+            if payload.get("anomalia") == True:
+                counter_anomalie += 1
 
-            # PUBBLICA SUBTOPIC PER NODE-RED (Dati singoli colonnina)
+            # STAMPA RIEPILOGO AGGIORNATA (Senza togliere le info originali)
+            status_icon = "⚠️" if payload["anomalia"] else "✅"
+            print(f"   Col. {col.id} ({payload['veicolo']}): SoC {payload['soc']}% | "
+                  f"Pot. Eff. {payload['potenza_effettiva']} kW | "
+                  f"Temp: {payload['temperatura']}°C (Target: {payload['temperatura_predetta']}°C)")
+            print(f"      Diagnostica: {status_icon} {payload['diagnostica']}")
+
+            # Pubblicazione MQTT
             client.publish(f"ev/stazione/colonnina/{col.id}", json.dumps(payload))
 
-        # Analisi Totale Stazione (basata su potenze effettive già calcolate)
+        # Analisi Totale Stazione
         alert, totale_carica = server.analizza_stazione(parametri_con_potenza)
 
         server_data = {
@@ -475,12 +523,9 @@ def avvia_stazione(num_colonnine=4):
             "raffreddamento_centrale_attivo": server.raffreddamento_centrale_attivo
         }
 
-        # PUBBLICA TOPIC TELEMETRIA GENERALE
         client.publish(MQTT_TOPIC_TELEMETRY, json.dumps({"colonnine": parametri_con_potenza}))
-        # PUBBLICA TOPIC SERVER (Dati aggregati)
         client.publish(MQTT_TOPIC_SERVER, json.dumps(server_data))
 
-        # Stampa l'esito dell'analisi aggregata
         if alert:
             print(f" ALERT STAZIONE: {alert}")
         if server.raffreddamento_centrale_attivo:
@@ -489,10 +534,13 @@ def avvia_stazione(num_colonnine=4):
 
         time.sleep(2)
 
-    print("\n SIMULAZIONE COMPLETATA")
+    # AGGIUNTA: Stampa del report finale anomalie
+    print("\n" + "="*50)
+    print(f" SIMULAZIONE COMPLETATA")
+    print(f" REPORT DIAGNOSTICA: Riscontrate {counter_anomalie} anomalie dei sensori.")
+    print("="*50)
+
     client.loop_stop()
-
-
 # MAIN
 if __name__ == "__main__":
     # Puoi cambiare la modalità della stazione qui per testare Eco o Boost
