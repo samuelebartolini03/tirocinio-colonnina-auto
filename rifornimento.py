@@ -3,6 +3,8 @@ import time
 import json
 import paho.mqtt.client as mqtt
 import math
+import numpy as np
+from scipy.stats import entropy, norm
 
 # SISTEMA DI AUTENTICAZIONE
 UTENTI = {
@@ -73,6 +75,75 @@ class AgenteLocale:
         self.isteresi_raff_locale = 3.0
         self.ultima_temp_vista = 25.0
         self.voto_centrale_ultimo = 0.0
+        self.beliefs = {
+            'p_fail_raff_locale': CONFIG["prob_fail_raffreddamento_locale"],  # Prior
+            'p_fail_raff_centrale': CONFIG["prob_fail_raffreddamento_centrale"],
+            'var_temp': 5.0  # Varianza iniziale incertezza temperatura
+        }
+
+    def genera_politiche(self):
+        # Politiche candidate: dict di azioni possibili
+        return [
+            {'raff_locale': True, 'downgrade': False, 'rid_pot': 0.0},  # Aggressiva: raff + full power
+            {'raff_locale': False, 'downgrade': True, 'rid_pot': 0.3},  # Conservativa: downgrade + riduci 30%
+            {'raff_locale': True, 'downgrade': True, 'rid_pot': 0.1},   # Bilanciata
+            {'raff_locale': False, 'downgrade': False, 'rid_pot': 0.0}  # No azione (fallback)
+        ]
+
+    def calcola_efe(self, politica, stato_attuale, orizzonte=3):
+        efe = 0.0
+        for t in range(orizzonte):
+            samples = []
+            for _ in range(50):  # Monte Carlo samples
+                temp_futura = stato_attuale['temperatura'] + np.random.normal(5, self.beliefs['var_temp'])  # Inc + noise
+                if politica['raff_locale']:
+                    if np.random.rand() < self.beliefs['p_fail_raff_locale']:
+                        temp_futura += CONFIG['aumento_temp_fail_raff']
+                    else:
+                        temp_futura -= 10.0  # Effetto raff successo
+                if politica['downgrade']:
+                    temp_futura -= 2.0  # Downgrade riduce calore
+                soc_futura = stato_attuale['soc'] + (stato_attuale.get('potenza_effettiva', 0) * (1 - politica['rid_pot']) / 60)
+                samples.append({'temp': temp_futura, 'soc': soc_futura})
+
+            # Statistiche
+            temps = [s['temp'] for s in samples]
+            mean_temp = np.mean(temps)
+            var_temp = np.var(temps)
+            mean_soc = np.mean([s['soc'] for s in samples])
+
+            # Pragmatica: KL da preferenze (temp ~ N(40,5), soc alto)
+            pref_dist_temp = norm(loc=40, scale=5)
+            sim_dist_temp = norm(loc=mean_temp, scale=np.sqrt(var_temp))
+            kl_prag_temp = self.kl_divergence(sim_dist_temp, pref_dist_temp)
+            kl_prag_soc = abs(mean_soc - 100) * 0.1  # Penalità SoC basso
+            kl_prag = kl_prag_temp + kl_prag_soc
+
+            # Epistemica: Entropia (incertezza)
+            hist, _ = np.histogram(temps, bins=10)
+            hist = hist / hist.sum()
+            ent_epist = entropy(hist)
+
+            efe += kl_prag + ent_epist
+
+        return efe
+
+    def kl_divergence(self, p, q, num_samples=1000):
+        samples = p.rvs(num_samples)
+        log_ratios = np.log(p.pdf(samples) / q.pdf(samples))
+        return np.mean(log_ratios[np.isfinite(log_ratios)])  # Evita inf/nan
+
+    def aggiorna_beliefs(self, fallito, tipo_raff):
+        # Aggiornamento bayesiano semplice (beta per prob fail)
+        key = 'p_fail_raff_locale' if tipo_raff == 'locale' else 'p_fail_raff_centrale'
+        prior_alpha = 1  # Beta prior debole
+        prior_beta = 19  # Per ~5% iniziale
+        if fallito:
+            self.beliefs[key] = (self.beliefs[key] * (prior_alpha + prior_beta) + 1) / (prior_alpha + prior_beta + 1)
+        else:
+            self.beliefs[key] = (self.beliefs[key] * (prior_alpha + prior_beta)) / (prior_alpha + prior_beta + 1)
+        # Aggiorna var_temp basata su fallito
+        self.beliefs['var_temp'] = max(1.0, self.beliefs['var_temp'] * 0.9 if not fallito else self.beliefs['var_temp'] * 1.1)
 
     def decide(self, info_globali=None):
         p = self.colonnina.leggi_parametri()
@@ -80,35 +151,31 @@ class AgenteLocale:
             p.update(info_globali)
 
         temp = p["temperatura"]
-        potenza = p.get("potenza_effettiva", 0)
+        stato_attuale = {
+            'temperatura': temp,
+            'soc': p['soc'],
+            'potenza_effettiva': p.get("potenza_effettiva", 0)
+        }
 
-        # Raffreddamento locale
-        soglia = CONFIG["soglia_temp_alta"]
-        if self.ultima_temp_vista > CONFIG["soglia_temp_alta"] + 2:
-            soglia -= self.isteresi_raff_locale
+        # Calcola EFE per politiche
+        politiche = self.genera_politiche()
+        efe_values = [self.calcola_efe(pol, stato_attuale) for pol in politiche]
+        best_idx = np.argmin(efe_values)
+        best_pol = politiche[best_idx]
+        min_efe = efe_values[best_idx]
 
-        locale_richiesto = temp >= soglia and potenza > CONFIG["min_power_for_active"] * 1.5
-
-        # Voto per centrale
-        voto = 0.0
-        if temp >= CONFIG["soglia_temp_critica"]:
-            voto = 1.0
-        elif temp > CONFIG["soglia_temp_alta"] + 8:
-            voto = 0.85
-        elif temp > CONFIG["soglia_temp_alta"] + 3:
-            voto = 0.60
-        elif temp > CONFIG["soglia_temp_alta"]:
-            voto = 0.35
-
+        # Estrai decisioni da best_pol
+        locale_richiesto = best_pol['raff_locale']
+        downgrade_req = best_pol['downgrade']
+        # Voto centrale: semplificato
+        voto = 0.35 if temp > CONFIG["soglia_temp_alta"] else 0.0
         if p.get("quante_altre_calda", 0) >= 2:
-            voto = min(1.0, voto + 0.25)
+            voto += 0.25
+        voto = min(1.0, voto)
 
-        # Downgrade modalità
-        downgrade_req = temp >= CONFIG["soglia_temp_alta"] + 5
-
-        motiv = f"Temp {temp:.1f}°C | Voto centrale {voto:.2f}"
+        motiv = f"Temp {temp:.1f}°C | EFE min {min_efe:.2f} | Politica: {best_pol}"
         if locale_richiesto:
-            motiv += " → RAFF. LOCALE RICHIESTO"
+            motiv += " → RAFF. LOCALE"
 
         self.ultima_temp_vista = temp
         self.voto_centrale_ultimo = voto
@@ -117,9 +184,11 @@ class AgenteLocale:
             "raffreddamento_locale_richiesto": locale_richiesto,
             "voto_raffreddamento_centrale": round(voto, 2),
             "downgrade_modalita_richiesto": downgrade_req,
+            "rid_pot_richiesta": best_pol['rid_pot'],  # Nuova
             "motivazione_agente": motiv,
             "temp": temp,
-            "anomalia": p["anomalia"]
+            "anomalia": p["anomalia"],
+            "min_efe": min_efe  # Per server
         }
 
 # COLONNINA
@@ -166,7 +235,8 @@ class Colonnina:
             CONFIG["prob_fail_raffreddamento_locale"]
         )
 
-        if random.random() < prob_fail:
+        fallito = random.random() < prob_fail
+        if fallito:
             self.fail_raff_consecutivi += 1
             self.stato_raff_fallito = True
 
@@ -175,14 +245,17 @@ class Colonnina:
                 self.carica_attiva = False
                 print(f"!!! COLONNINA {self.id} → BLOCCATA "
                       f"(raffreddamento fallito {self.fail_raff_consecutivi} volte consecutive)")
+                self.agente.aggiorna_beliefs(fallito, self.ultimo_raff_usato)
                 return True
 
             print(f"  Colonnina {self.id}: raffreddamento ({self.ultimo_raff_usato}) FALLITO "
                   f"({self.fail_raff_consecutivi})")
+            self.agente.aggiorna_beliefs(fallito, self.ultimo_raff_usato)
             return False
 
         # successo
         self.reset_raff_fail()
+        self.agente.aggiorna_beliefs(fallito, self.ultimo_raff_usato)
         return False
 
     def assegna_auto(self):
@@ -297,7 +370,7 @@ class Server:
             if p.get("stato") != "OCCUPATA":
                 continue
 
-            col = next((c for c in colonnine if c.id == p["id"]), None) 
+            col = next((c for c in colonnine if c.id == p["id"]), None)
             if not col:
                 continue
 
@@ -313,11 +386,13 @@ class Server:
             if decisione.get("downgrade_modalita_richiesto"):
                 richieste_downgrade.append((p["id"], decisione["temp"], p))
 
-        # Fase 2: max 2 raffreddamenti
+        # Fase 2: max 2 raffreddamenti (usa EFE invece di voti)
+        efe_medie = [decisione.get("min_efe", 0) for p in lista_parametri if "agente" in p]
+        media_efe = sum(efe_medie) / len(efe_medie) if efe_medie else 0.0
         attivati_raff = 0
         richieste_raff_locali.sort(key=lambda x: x[1], reverse=True)
 
-        if self.media_voti_centrali >= 0.70 or self.quante_colonnine_calide >= 3:
+        if media_efe > 5.0 or self.quante_colonnine_calide >= 3:  # Soglia EFE (regola dopo test)
             if attivati_raff < CONFIG["max_raffreddamenti_per_ciclo"]:
                 self.raffreddamento_centrale_attivo = True
                 attivati_raff += 1
@@ -381,6 +456,8 @@ class Server:
             if veicolo:
                 req = min(req, VEICOLI[veicolo]["max_potenza"])
             req = min(req, CONFIG["max_potenza"])
+
+            req *= (1 - p["agente"].get("rid_pot_richiesta", 0.0))  # Riduzione da EFE
 
             p["richiesta_adjusted"] = round(req, 1)
             totale_richiesto += req
@@ -495,7 +572,7 @@ def avvia_stazione(num_colonnine=4):
     server = Server()
 
     counter_anomalie = 0
-    cicli_simulati = 10
+    cicli_simulati = 50
     print(f"\n Avvio simulazione per {cicli_simulati} cicli. {num_colonnine} colonnine.")
 
     for ciclo in range(cicli_simulati):
@@ -546,6 +623,9 @@ def avvia_stazione(num_colonnine=4):
             col.raffreddamento_attivo = p.get("raffreddamento_locale_attivo", False) or server.raffreddamento_centrale_attivo
             col.aggiorna_soc(potenza_effettiva)
 
+            if "agente" in p:
+                print(f"   Agente Col. {p['id']}: {p['agente']['motivazione_agente']}")
+
             payload = {
                 "id": col.id,
                 "veicolo": col.veicolo,
@@ -592,10 +672,6 @@ def avvia_stazione(num_colonnine=4):
             "modalita_stazione": CONFIG["modalita"],
             "raffreddamento_centrale_attivo": server.raffreddamento_centrale_attivo,
         }
-
-        # client.publish(MQTT_TOPIC_TELEMETRY, json.dumps({"colonnine": parametri_con_potenza}))  # Uncomment
-        # client.publish(MQTT_TOPIC_SERVER, json.dumps(server_data))  # Uncomment
-
         if alert:
             print(f" ALERT STAZIONE: {alert}")
         if server.raffreddamento_centrale_attivo:
@@ -612,3 +688,4 @@ def avvia_stazione(num_colonnine=4):
 if __name__ == "__main__":
     if login():
         avvia_stazione(num_colonnine=4)
+        
