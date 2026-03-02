@@ -345,7 +345,7 @@ class Colonnina:
 
         return dati
 
-# SERVER - FIX PRINCIPALE
+# SERVER
 class Server:
     def __init__(self):
         self.quante_colonnine_calide = 0
@@ -448,8 +448,7 @@ class Server:
             elif p.get("degrado", 0) > CONFIG["soglia_degrado"]:
                 assegnazioni[idc] = 0.0
                 p.setdefault("azioni", []).append("FERMA: Degrado Alto")
-
-        # FIX PRINCIPALE: seleziona chi NON è stato escluso
+                
         attive = [p for p in dati if assegnazioni[p["id"]] == 0.0]   # ← MODIFICATO (era != 0.0)
 
         if not attive:
@@ -598,14 +597,13 @@ def avvia_stazione(num_colonnine=4):
 
         parametri_con_potenza = server.distribuisci_potenza(parametri_lista)
 
-        # <<< AGGIUNTO: aggiornamento SoC (era mancante) >>>
         for p in parametri_con_potenza:
             if p.get("stato") == "OCCUPATA":
                 col = next((c for c in colonnine if c.id == p["id"]), None)
                 if col:
                     col.aggiorna_soc(p.get("potenza_effettiva", 0))
 
-        # Raccolta statistiche (invariato)
+        # Raccolta statistiche
         efe_values_this_cycle = []
         temps_this_cycle = []
         socs_this_cycle = []
@@ -657,7 +655,7 @@ def avvia_stazione(num_colonnine=4):
 
         time.sleep(0.5)
 
-    # REPORT + GRAFICI (invariato)
+    # REPORT + GRAFICI
     print("\n" + "="*80)
     print(" RISULTATI SPERIMENTALI – ACTIVE INFERENCE")
     print("="*80)
@@ -726,4 +724,4 @@ def avvia_stazione(num_colonnine=4):
 if __name__ == "__main__":
     if login():
         avvia_stazione(num_colonnine=4)
-        
+    
