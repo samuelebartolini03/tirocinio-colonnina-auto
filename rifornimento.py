@@ -71,7 +71,7 @@ class Sensore:
             return round(random.uniform(350, 800), 1)
         return 0.0
 
-# AGENTE LOCALE (Active Inference) - invariato
+# AGENTE LOCALE
 class AgenteLocale:
     def __init__(self, colonnina):
         self.colonnina = colonnina
@@ -725,3 +725,4 @@ if __name__ == "__main__":
     if login():
         avvia_stazione(num_colonnine=4)
     
+
