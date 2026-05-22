@@ -1,7 +1,7 @@
 import random
 import time
 import json
-import paho.mqtt.client as mqtt  # non usato attivamente qui, ma tenuto per compatibilità
+import paho.mqtt.client as mqtt  
 import math
 import numpy as np
 from scipy.stats import entropy, norm
