@@ -1,7 +1,7 @@
 import random
 import time
 import json
-import paho.mqtt.client as mqtt  
+import paho.mqtt.client as mqtt  # non usato attivamente qui, ma tenuto per compatibilità
 import math
 import numpy as np
 from scipy.stats import entropy, norm
@@ -31,20 +31,20 @@ def login():
 
 # CONFIGURAZIONE STAZIONE
 CONFIG = {
-    "max_potenza": 150,
-    "soglia_temp_alta": 55,
-    "soglia_temp_critica": 70,
-    "soglia_degrado": 90,
-    "modalita": "Standard",
-    "potenza_massima_stazione": 300,
-    "percentuale_riduzione_temp_alta": 0.30,   # ← MODIFICATO (era 0.5)
-    "min_power_for_active": 0.5,               # ← MODIFICATO (era 1.0) → ora vede potenza
-    "cicli_attesa_blocco": 1,
-    "max_raffreddamenti_per_ciclo": 2,
-    "prob_fail_raffreddamento_locale": 0.06,
-    "prob_fail_raffreddamento_centrale": 0.04,
-    "soglia_fail_consecutivi_blocco": 3,
-    "aumento_temp_fail_raff": 3.5,
+    "max_potenza": 150, # kw massimi per singola colonnina
+    "soglia_temp_alta": 55, # °C in cui inizia ad allarmarsi
+    "soglia_temp_critica": 70, # °C in cui si ferma la ricarica
+    "soglia_degrado": 90, # % di degrado della batteria
+    "modalita": "Standard", # modalità erogazione potenza colonnina
+    "potenza_massima_stazione": 300, # kw massimi per  tutte le colonnine
+    "percentuale_riduzione_temp_alta": 0.30, # riduzione del 30% della temperatura alta
+    "min_power_for_active": 0.5, # kw minimi per attivare ricarica
+    "cicli_attesa_blocco": 1, # cicli messi in attesa prima di attivare il blocco
+    "max_raffreddamenti_per_ciclo": 2, # raffreddamenti massimi attivabili per ciclo
+    "prob_fail_raffreddamento_locale": 0.06, # 6% probabilità di fallire il raffreddamento
+    "prob_fail_raffreddamento_centrale": 0.04, # 4% probabilità di fallire con il downgrade
+    "soglia_fail_consecutivi_blocco": 3, # num massimo di fallimenti prima di bloccare la colonnina
+    "aumento_temp_fail_raff": 3.5, # °C in caso di avvenuto fallimento
 }
 
 VEICOLI = {
@@ -60,9 +60,9 @@ class Sensore:
 
     def rileva(self):
         if self.tipo == "temperatura":
-            if random.random() < 0.1:
-                return round(random.uniform(50, 90), 1)
-            return round(random.uniform(20, 40), 1)
+            if random.random() < 0.1: # 10% probabilità fallimento
+                return round(random.uniform(50, 90), 1) # lettura temperatura alta
+            return round(random.uniform(20, 40), 1) # lettura temperatura normale
         elif self.tipo == "temperatura_esterna":
             return round(random.uniform(10, 45), 1)
         elif self.tipo == "degrado":
@@ -75,50 +75,49 @@ class Sensore:
 class AgenteLocale:
     def __init__(self, colonnina):
         self.colonnina = colonnina
-        self.isteresi_raff_locale = 3.0
-        self.ultima_temp_vista = 25.0
-        self.voto_centrale_ultimo = 0.0
+        self.isteresi_raff_locale = 3.0 # isteresi per evitare oscillazioni
+        self.ultima_temp_vista = 25.0 # memorizzata temperatura precedente
+        self.voto_centrale_ultimo = 0.0 # ultimo voto inviato al server
         self.beliefs = {
             'p_fail_raff_locale': CONFIG["prob_fail_raffreddamento_locale"],
             'p_fail_raff_centrale': CONFIG["prob_fail_raffreddamento_centrale"],
-            'var_temp': 5.0
+            'var_temp': 5.0 # varianza stimata della temperatura
         }
 
     def genera_politiche(self):
         return [
-            {'raff_locale': True,  'downgrade': False, 'rid_pot': 0.0},
-            {'raff_locale': False, 'downgrade': True,  'rid_pot': 0.3},
-            {'raff_locale': True,  'downgrade': True,  'rid_pot': 0.1},
-            {'raff_locale': False, 'downgrade': False, 'rid_pot': 0.0}
+            {'raff_locale': True,  'downgrade': False, 'rid_pot': 0.0}, # decide se attivare il raffrddamento locale
+            {'raff_locale': False, 'downgrade': True,  'rid_pot': 0.3}, # decide se attivare il downgrade di potenza con riduzione potenza
+            {'raff_locale': True,  'downgrade': True,  'rid_pot': 0.1}, # attiva entrambi e riduce potenza
+            {'raff_locale': False, 'downgrade': False, 'rid_pot': 0.0} # non attiva nessuno dei due
         ]
 
     def calcola_efe(self, politica, stato_attuale, orizzonte=3):
         efe = 0.0
-        for t in range(orizzonte):
+        for t in range(orizzonte): # proiezione sui 3 passi futuri
             samples = []
-            for _ in range(50):
-                temp_futura = stato_attuale['temperatura'] + np.random.normal(5, self.beliefs['var_temp'])
+            for _ in range(50): # prende come spunto 50 campioni di Monte Carlo
+                temp_futura = stato_attuale['temperatura'] + np.random.normal(5, self.beliefs['var_temp']) # predizione temperatura futura
                 if politica['raff_locale']:
                     if np.random.rand() < self.beliefs['p_fail_raff_locale']:
-                        temp_futura += CONFIG['aumento_temp_fail_raff']
+                        temp_futura += CONFIG['aumento_temp_fail_raff'] # in caso di fallimento peggiora la configurazione
                     else:
-                        temp_futura -= 10.0
+                        temp_futura -= 10.0 # in caso di successo del sistema di raffreddamento riduce la temperatura del 10%
                 if politica['downgrade']:
-                    temp_futura -= 2.0
+                    temp_futura -= 2.0 # in caso di successo del downgrade riduce temperatura 2%
                 soc_futura = stato_attuale['soc'] + (stato_attuale.get('potenza_effettiva', 0) * (1 - politica['rid_pot']) / 60)
                 samples.append({'temp': temp_futura, 'soc': soc_futura})
-
+            # Calcolo KL divergence (pragmatico) + Entropia (epistemico)
             temps = [s['temp'] for s in samples]
             mean_temp = np.mean(temps)
             var_temp = np.var(temps)
             mean_soc = np.mean([s['soc'] for s in samples])
-
-            pref_dist_temp = norm(loc=40, scale=5)
-            sim_dist_temp = norm(loc=mean_temp, scale=np.sqrt(var_temp))
-            kl_prag_temp = self.kl_divergence(sim_dist_temp, pref_dist_temp)
+            pref_dist_temp = norm(loc=40, scale=5)  # distribuzione preferita dal codice
+            sim_dist_temp = norm(loc=mean_temp, scale=np.sqrt(var_temp))  # distribuzione simulata
+            kl_prag_temp = self.kl_divergence(sim_dist_temp, pref_dist_temp) # divergenza KL quanto ci allontaniamo dalle preferenze
             kl_prag_soc = abs(mean_soc - 100) * 0.1
             kl_prag = kl_prag_temp + kl_prag_soc
-
+            # Entropia - incertezza sulle previsioni
             hist, _ = np.histogram(temps, bins=10)
             hist = hist / hist.sum() if hist.sum() > 0 else hist
             ent_epist = entropy(hist)
@@ -141,7 +140,7 @@ class AgenteLocale:
             self.beliefs[key] = (old_p * (prior_alpha + prior_beta) + 1) / (prior_alpha + prior_beta + 1)
         else:
             self.beliefs[key] = (old_p * (prior_alpha + prior_beta)) / (prior_alpha + prior_beta + 1)
-        self.beliefs['var_temp'] = max(1.0, self.beliefs['var_temp'] * (1.1 if fallito else 0.9))
+        self.beliefs['var_temp'] = max(1.0, self.beliefs['var_temp'] * (1.1 if fallito else 0.9))  # adattamento varianza successo/fallimmento
 
     def decide(self, info_globali=None):
         p = self.colonnina.leggi_parametri()
@@ -154,7 +153,7 @@ class AgenteLocale:
             'soc': p['soc'],
             'potenza_effettiva': p.get("potenza_effettiva", 0)
         }
-
+        # valuta tutte le politiche
         politiche = self.genera_politiche()
         efe_values = [self.calcola_efe(pol, stato_attuale) for pol in politiche]
         best_idx = np.argmin(efe_values)
@@ -166,7 +165,7 @@ class AgenteLocale:
 
         locale_richiesto = best_pol['raff_locale']
         downgrade_req = best_pol['downgrade']
-
+        # calcolo voto per raffreddamento centrale
         voto = 0.35 if temp > CONFIG["soglia_temp_alta"] else 0.0
         if p.get("quante_altre_calda", 0) >= 2:
             voto += 0.25
@@ -198,9 +197,9 @@ class Colonnina:
         self.capacita = None
         self.soc_kwh = 0.0
         self.carica_attiva = False
-        self.stato = "LIBERA"
-        self.modalita = "Standard"
-
+        self.stato = "LIBERA"  # stato colonnina se LIBERA, OCCUPATA, COMPLETATA, BLOCCATA
+        self.modalita = "Standard"  # modalità di erogazione della potenza
+        # sensori che vengono integrati
         self.s_temp = Sensore("temperatura")
         self.s_temp_ext = Sensore("temperatura_esterna")
         self.s_deg = Sensore("degrado")
@@ -275,7 +274,7 @@ class Colonnina:
     def leggi_parametri(self) -> dict:
         t_esterna = self.s_temp_ext.rileva()
         t_reale_sensore = self.s_temp.rileva()
-
+        # calcola la temperatura predetta su base modello fisico
         if self.stato.startswith("BLOCCATA"):
             potenza_teorica = 0.0
             temp_predetta = t_esterna + 1.0
@@ -292,7 +291,7 @@ class Colonnina:
                 potenza_teorica = 0
                 temp_predetta = t_esterna + 1.0
                 inc_teorico = 0
-
+        # rileva anomalie
         gap = abs(t_reale_sensore - temp_predetta)
         soglia_anomalia = 15.0
         soglia_media_pericolosa = 45.0
@@ -351,7 +350,7 @@ class Server:
         self.quante_colonnine_calide = 0
         self.media_voti_centrali = 0.0
 
-    def distribuisci_potenza(self, lista_parametri):
+    def distribuisci_potenza(self, lista_parametri): # raccoglie decisioni dagli agenti locali
         richieste_raff_locali = []
         richieste_downgrade = []
 
@@ -448,7 +447,7 @@ class Server:
             elif p.get("degrado", 0) > CONFIG["soglia_degrado"]:
                 assegnazioni[idc] = 0.0
                 p.setdefault("azioni", []).append("FERMA: Degrado Alto")
-                
+
         attive = [p for p in dati if assegnazioni[p["id"]] == 0.0]   # ← MODIFICATO (era != 0.0)
 
         if not attive:
@@ -462,7 +461,7 @@ class Server:
             return out
 
         attive_sorted = sorted(attive, key=lambda x: x.get("soc", 100.0))
-
+        # calcolo potenza disponibile e allocazione
         totale_attive_richieste = sum(p["richiesta_adjusted"] for p in attive_sorted)
 
         if totale_attive_richieste <= potenza_disponibile:
@@ -476,6 +475,7 @@ class Server:
                     p.setdefault("azioni", []).append("OK")
                 assegnazioni[idc] = round(max(0, alloc), 1)
         else:
+            # priorità a chi ha il SoC più basso
             restante = potenza_disponibile
             for p in attive_sorted:
                 idc = p["id"]
@@ -536,11 +536,11 @@ class Server:
             alert = f"ATTENZIONE: {num_bloccate} colonnine bloccate per guasto raffreddamento!"
         return alert, round(totale_kw, 1)
 
-def avvia_stazione(num_colonnine=4):
+def avvia_stazione(num_colonnine=4): # inizializza la stazione
     global colonnine
     colonnine = [Colonnina(id=i+1) for i in range(num_colonnine)]
     server = Server()
-
+    # definite le statistiche
     stats = {
         'cicli': [],
         'efe_medio': [],
@@ -562,12 +562,12 @@ def avvia_stazione(num_colonnine=4):
 
     random.seed(42)
     np.random.seed(42)
-
+    # simula cicli per 40 giri
     for ciclo in range(cicli_simulati):
         print(f"\n --- CICLO {ciclo + 1}/{cicli_simulati} ---")
 
         parametri_lista = []
-
+        # aggiornamento stati delle colonnine
         for col in colonnine:
             if col.stato == "LIBERA":
                 if random.random() < 0.4:
@@ -596,7 +596,7 @@ def avvia_stazione(num_colonnine=4):
         server.media_voti_centrali = sum(voti_centrali) / len(voti_centrali) if voti_centrali else 0.0
 
         parametri_con_potenza = server.distribuisci_potenza(parametri_lista)
-
+        # aggiorna SoC
         for p in parametri_con_potenza:
             if p.get("stato") == "OCCUPATA":
                 col = next((c for c in colonnine if c.id == p["id"]), None)
@@ -668,14 +668,14 @@ def avvia_stazione(num_colonnine=4):
 
     fig, axs = plt.subplots(3, 2, figsize=(15, 12))
     fig.suptitle("Risultati sperimentali – Active Inference", fontsize=16)
-
+    # grafico 1: EFE MEDIO
     axs[0,0].plot(stats['cicli'], stats['efe_medio'], 'b-', label='EFE medio')
     axs[0,0].set_title("Expected Free Energy medio")
     axs[0,0].set_xlabel("Ciclo")
     axs[0,0].set_ylabel("EFE")
     axs[0,0].grid(True)
     axs[0,0].legend()
-
+    # grafico 2: Temperature
     axs[0,1].plot(stats['cicli'], stats['temp_medie'], 'r-', label='Temp media')
     axs[0,1].plot(stats['cicli'], stats['temp_max'],   'r--', label='Temp max')
     axs[0,1].axhline(CONFIG["soglia_temp_alta"], color='orange', ls='--', label='Soglia alta')
@@ -685,27 +685,27 @@ def avvia_stazione(num_colonnine=4):
     axs[0,1].set_ylabel("°C")
     axs[0,1].grid(True)
     axs[0,1].legend()
-
+    # grafico 3: SoC medio
     axs[1,0].plot(stats['cicli'], stats['soc_medio'], 'g-', label='SoC medio')
     axs[1,0].set_title("Stato di carica medio")
     axs[1,0].set_xlabel("Ciclo")
     axs[1,0].set_ylabel("%")
     axs[1,0].grid(True)
     axs[1,0].legend()
-
+    # grafico 4: fallimenti raffreddamento
     axs[1,1].bar(stats['cicli'], stats['fallimenti_raff'], color='purple', alpha=0.6)
     axs[1,1].set_title("Fallimenti raffreddamento per ciclo")
     axs[1,1].set_xlabel("Ciclo")
     axs[1,1].set_ylabel("N°")
     axs[1,1].grid(True, axis='y')
-
+    # grafico 5: evoluzione credenze
     axs[2,0].plot(stats['cicli'], stats['p_fail_medio'], 'm-', label='p(fail raff) medio')
     axs[2,0].plot(stats['cicli'], stats['var_temp_medio'], 'c-', label='var_temp media')
     axs[2,0].set_title("Evoluzione credenze bayesiane")
     axs[2,0].set_xlabel("Ciclo")
     axs[2,0].grid(True)
     axs[2,0].legend()
-
+    # grafico 6: potenza totale
     axs[2,1].plot(stats['cicli'], stats['potenza_totale'], 'darkgreen', label='Potenza totale')
     axs[2,1].axhline(CONFIG["potenza_massima_stazione"], color='red', ls='--', label='Limite')
     axs[2,1].set_title("Potenza erogata totale")
@@ -724,6 +724,3 @@ def avvia_stazione(num_colonnine=4):
 if __name__ == "__main__":
     if login():
         avvia_stazione(num_colonnine=4)
-    
-
-
