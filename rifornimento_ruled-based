@@ -254,7 +254,7 @@ class Server:
                 if col.stato.startswith("BLOCCATA"):
                     p["stato"] = col.stato
 
-        # === ALLOCAZIONE POTENZA (Rule-based) ===
+        # === ALLOCAZIONE POTENZA===
         potenza_disponibile = CONFIG["potenza_massima_stazione"]
         assegnazioni = {}
 
