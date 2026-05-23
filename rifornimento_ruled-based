@@ -1,0 +1,388 @@
+import random
+import time
+import json
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+# ==================== SISTEMA DI AUTENTICAZIONE ====================
+UTENTI = {
+    "admin": "1234",
+    "tecnico": "password",
+    "ospite": "guest"
+}
+
+
+def login():
+    print(" ACCESSO SICURO ALLA STAZIONE DI RICARICA")
+    tentativi = 3
+    while tentativi > 0:
+        user = input("Username: ").strip()
+        pwd = input("Password: ").strip()
+        if user in UTENTI and UTENTI[user] == pwd:
+            print(f"\n Accesso consentito. Benvenuto, {user}!\n")
+            return True
+        tentativi -= 1
+        print(f" Credenziali errate. Tentativi rimasti: {tentativi}")
+    print(" Troppi tentativi falliti. Uscita dal sistema.\n")
+    exit()
+
+
+# ==================== CONFIGURAZIONE ====================
+CONFIG = {
+    "max_potenza": 150,
+    "soglia_temp_alta": 55,
+    "soglia_temp_critica": 70,
+    "soglia_degrado": 90,
+    "potenza_massima_stazione": 300,
+    "percentuale_riduzione_temp_alta": 0.30,
+    "min_power_for_active": 0.5,
+    "max_raffreddamenti_per_ciclo": 2,
+    "soglia_fail_consecutivi_blocco": 3,
+    "aumento_temp_fail_raff": 3.5,
+}
+
+VEICOLI = {
+    "CityCar": {"batteria": 40, "max_potenza": 50},
+    "SUV": {"batteria": 80, "max_potenza": 120},
+    "Sportiva": {"batteria": 100, "max_potenza": 150}
+}
+
+
+# ==================== SENSORI ====================
+class Sensore:
+    def __init__(self, tipo):
+        self.tipo = tipo
+
+    def rileva(self):
+        if self.tipo == "temperatura":
+            return round(random.uniform(20, 45) if random.random() < 0.9 else random.uniform(50, 85), 1)
+        elif self.tipo == "temperatura_esterna":
+            return round(random.uniform(10, 45), 1)
+        elif self.tipo == "degrado":
+            return round(random.uniform(5, 15), 1)
+        elif self.tipo == "tensione":
+            return round(random.uniform(350, 800), 1)
+        return 0.0
+
+
+# ==================== AGENTE RULE-BASED ====================
+class AgenteLocale:
+    def __init__(self, colonnina):
+        self.colonnina = colonnina
+
+    def decide(self, info_globali=None):
+        p = self.colonnina.leggi_parametri()
+        temp = p["temperatura"]
+        soc = p["soc"]
+
+        # === REGOLE DI DECISIONE ===
+        raff_locale = False
+        downgrade = False
+        rid_pot = 0.0
+        voto_centrale = 0.0
+
+        if temp > CONFIG["soglia_temp_critica"]:
+            raff_locale = True
+            downgrade = True
+            rid_pot = 0.5
+            voto_centrale = 1.0
+        elif temp > CONFIG["soglia_temp_alta"]:
+            raff_locale = True
+            downgrade = True
+            rid_pot = 0.25
+            voto_centrale = 0.7
+        elif temp > 48:
+            raff_locale = True
+            voto_centrale = 0.4
+
+        # Priorità raffreddamento centrale se molte colonnine sono calde
+        if info_globali and info_globali.get("quante_altre_calda", 0) >= 2:
+            voto_centrale = min(1.0, voto_centrale + 0.3)
+
+        motiv = f"Temp {temp:.1f}°C | Regola: "
+        if raff_locale and downgrade:
+            motiv += "RAFFREDDAMENTO + DOWNGRADE"
+        elif raff_locale:
+            motiv += "RAFFREDDAMENTO LOCALE"
+        elif downgrade:
+            motiv += "DOWNGRADE POTENZA"
+        else:
+            motiv += "NESSUNA AZIONE"
+
+        return {
+            "raffreddamento_locale_richiesto": raff_locale,
+            "voto_raffreddamento_centrale": round(voto_centrale, 2),
+            "downgrade_modalita_richiesto": downgrade,
+            "rid_pot_richiesta": rid_pot,
+            "motivazione_agente": motiv,
+            "temp": temp,
+            "anomalia": p["anomalia"],
+            "min_efe": 0.0  # non più usato
+        }
+
+
+# ==================== COLONNINA ====================
+class Colonnina:
+    def __init__(self, id):
+        self.id = id
+        self.veicolo = None
+        self.capacita = None
+        self.soc_kwh = 0.0
+        self.carica_attiva = False
+        self.stato = "LIBERA"
+        self.modalita = "Standard"
+
+        self.s_temp = Sensore("temperatura")
+        self.s_temp_ext = Sensore("temperatura_esterna")
+        self.s_deg = Sensore("degrado")
+        self.s_tens = Sensore("tensione")
+
+        self.raffreddamento_attivo = False
+        self.fail_raff_consecutivi = 0
+        self.stato_raff_fallito = False
+        self.agente = AgenteLocale(self)
+
+    def reset_raff_fail(self):
+        self.fail_raff_consecutivi = 0
+        self.stato_raff_fallito = False
+
+    def applica_raffreddamento(self, centrale_attivo: bool, locale_attivo: bool) -> bool:
+        if not (centrale_attivo or locale_attivo):
+            self.reset_raff_fail()
+            return False
+
+        self.raffreddamento_attivo = True
+        fallito = random.random() < 0.08  # 8% probabilità di fallimento
+
+        if fallito:
+            self.fail_raff_consecutivi += 1
+            self.stato_raff_fallito = True
+            if self.fail_raff_consecutivi >= CONFIG["soglia_fail_consecutivi_blocco"]:
+                self.stato = "BLOCCATA_RAFF_FALLITO"
+                self.carica_attiva = False
+                print(f"!!! COLONNINA {self.id} BLOCCATA (raffreddamento fallito {self.fail_raff_consecutivi} volte)")
+                return True
+            print(f"  Colonnina {self.id}: Raffreddamento FALLITO ({self.fail_raff_consecutivi})")
+            return False
+
+        self.reset_raff_fail()
+        return False
+
+    def assegna_auto(self):
+        self.veicolo = random.choice(list(VEICOLI.keys()))
+        self.capacita = VEICOLI[self.veicolo]["batteria"]
+        self.soc_kwh = random.uniform(5, 0.25 * self.capacita)
+        self.carica_attiva = True
+        self.stato = "OCCUPATA"
+        self.modalita = random.choice(["Eco", "Standard", "Boost"])
+        print(f" Nuova auto ({self.veicolo}) sulla colonnina {self.id}")
+
+    def aggiorna_soc(self, potenza_effettiva: float):
+        if not self.carica_attiva or self.stato.startswith("BLOCCATA"):
+            return
+        self.soc_kwh = min(self.capacita, self.soc_kwh + (potenza_effettiva / 60.0))
+        if self.soc_kwh >= self.capacita * 0.98:
+            self.stato = "COMPLETATA"
+            self.carica_attiva = False
+            print(f" Colonnina {self.id}: Ricarica completata.")
+
+    def soc_percento(self):
+        return round((self.soc_kwh / self.capacita) * 100, 1) if self.capacita else 0.0
+
+    def leggi_parametri(self):
+        # ... (mantiene la logica esistente di sensori e anomalie)
+        t_esterna = self.s_temp_ext.rileva()
+        t_reale = self.s_temp.rileva()
+        potenza_teorica = random.uniform(40, 120) if self.stato == "OCCUPATA" else 0
+
+        gap = abs(t_reale - (t_esterna + potenza_teorica / 8))
+        anomalia = gap > 15
+
+        temperatura_output = max(t_reale, t_esterna + potenza_teorica / 10) if anomalia else t_reale
+
+        if self.stato.startswith("BLOCCATA"):
+            temperatura_output = max(temperatura_output, 75)
+
+        return {
+            "id": self.id,
+            "veicolo": self.veicolo,
+            "stato": self.stato,
+            "soc": self.soc_percento(),
+            "temperatura": round(temperatura_output, 1),
+            "anomalia": anomalia,
+            "degrado": self.s_deg.rileva(),
+            "potenza_richiesta": round(potenza_teorica, 1),
+            "raffreddamento_attivo": self.raffreddamento_attivo,
+            "fail_raff_consecutivi": self.fail_raff_consecutivi,
+            "modalita": self.modalita,
+        }
+
+
+# ==================== SERVER ====================
+class Server:
+    def __init__(self):
+        self.quante_colonnine_calide = 0
+
+    def distribuisci_potenza(self, lista_parametri):
+        # Richieste dagli agenti
+        richieste_raff = []
+        for p in lista_parametri:
+            if p.get("stato") != "OCCUPATA":
+                continue
+            col = next((c for c in colonnine if c.id == p["id"]), None)
+            if col:
+                decisione = col.agente.decide({"quante_altre_calda": self.quante_colonnine_calide})
+                p["agente"] = decisione
+                if decisione["raffreddamento_locale_richiesto"]:
+                    richieste_raff.append((p["id"], p["temperatura"], p))
+
+        # Approva raffreddamenti locali (max 2)
+        richieste_raff.sort(key=lambda x: x[1])  # priorità alle più calde
+        for i, (_, _, p) in enumerate(richieste_raff[:CONFIG["max_raffreddamenti_per_ciclo"]]):
+            p["raffreddamento_locale_attivo"] = True
+
+        # Applica raffreddamento
+        for p in lista_parametri:
+            if p.get("stato") != "OCCUPATA":
+                continue
+            col = next((c for c in colonnine if c.id == p["id"]), None)
+            if col:
+                locale = p.get("raffreddamento_locale_attivo", False)
+                col.applica_raffreddamento(False, locale)
+                if col.stato.startswith("BLOCCATA"):
+                    p["stato"] = col.stato
+
+        # === ALLOCAZIONE POTENZA (Rule-based) ===
+        potenza_disponibile = CONFIG["potenza_massima_stazione"]
+        assegnazioni = {}
+
+        attive = [p for p in lista_parametri if p.get("stato") == "OCCUPATA"]
+        attive.sort(key=lambda x: x.get("soc", 100))  # priorità SoC più basso
+
+        for p in attive:
+            req = p.get("potenza_richiesta", 0)
+            if p.get("agente", {}).get("downgrade_modalita_richiesto"):
+                req *= (1 - p["agente"]["rid_pot_richiesta"])
+
+            if p["temperatura"] > CONFIG["soglia_temp_alta"]:
+                req *= (1 - CONFIG["percentuale_riduzione_temp_alta"])
+
+            assegnazioni[p["id"]] = round(min(req, CONFIG["max_potenza"]), 1)
+
+        # Limita potenza totale
+        totale_richiesto = sum(assegnazioni.values())
+        if totale_richiesto > potenza_disponibile:
+            scala = potenza_disponibile / totale_richiesto
+            for pid in assegnazioni:
+                assegnazioni[pid] = round(assegnazioni[pid] * scala, 1)
+
+        # Assegna potenza finale
+        for p in lista_parametri:
+            if p.get("stato") == "OCCUPATA":
+                p["potenza_effettiva"] = assegnazioni.get(p["id"], 0.0)
+            else:
+                p["potenza_effettiva"] = 0.0
+
+        return lista_parametri
+
+
+# ==================== AVVIO SIMULAZIONE ====================
+def avvia_stazione(num_colonnine=4):
+    global colonnine
+    colonnine = [Colonnina(i + 1) for i in range(num_colonnine)]
+    server = Server()
+
+    stats = {
+        'cicli': [], 'temp_medie': [], 'temp_max': [], 'soc_medio': [],
+        'potenza_totale': [], 'fallimenti_raff': [], 'raffinamenti_locali': []
+    }
+
+    print(f"\n Avvio simulazione RULE-BASED per 40 cicli ({num_colonnine} colonnine)\n")
+
+    for ciclo in range(40):
+        print(f"\n --- CICLO {ciclo + 1}/40 ---")
+
+        parametri_lista = []
+        for col in colonnine:
+            if col.stato == "LIBERA" and random.random() < 0.4:
+                col.assegna_auto()
+            elif col.stato == "COMPLETATA":
+                col.stato = "LIBERA"
+                col.veicolo = None
+
+            parametri_lista.append(col.leggi_parametri())
+
+        server.quante_colonnine_calide = sum(1 for p in parametri_lista
+                                             if p.get("temperatura", 0) > CONFIG["soglia_temp_alta"])
+
+        parametri_con_potenza = server.distribuisci_potenza(parametri_lista)
+
+        # Aggiorna SoC
+        for p in parametri_con_potenza:
+            if p.get("stato") == "OCCUPATA":
+                col = next(c for c in colonnine if c.id == p["id"])
+                col.aggiorna_soc(p.get("potenza_effettiva", 0))
+
+        # Statistiche
+        temps = [p["temperatura"] for p in parametri_con_potenza if p.get("stato") == "OCCUPATA"]
+        socs = [p["soc"] for p in parametri_con_potenza if p.get("stato") == "OCCUPATA"]
+        potenza_tot = sum(p.get("potenza_effettiva", 0) for p in parametri_con_potenza)
+        fallimenti = sum(1 for col in colonnine if col.stato_raff_fallito)
+        raff_locali = sum(1 for p in parametri_con_potenza if p.get("raffreddamento_locale_attivo"))
+
+        stats['cicli'].append(ciclo + 1)
+        stats['temp_medie'].append(np.mean(temps) if temps else 0)
+        stats['temp_max'].append(max(temps) if temps else 0)
+        stats['soc_medio'].append(np.mean(socs) if socs else 0)
+        stats['potenza_totale'].append(potenza_tot)
+        stats['fallimenti_raff'].append(fallimenti)
+        stats['raffinamenti_locali'].append(raff_locali)
+
+        for p in parametri_con_potenza:
+            if p.get("stato") == "OCCUPATA":
+                print(f" Col. {p['id']}: SoC {p['soc']:5.1f}% | Pot. {p.get('potenza_effettiva', 0):6.1f} kW | "
+                      f"Temp {p['temperatura']:5.1f}°C")
+
+        print(f" Totale Carica Stazione: {potenza_tot:.1f} kW")
+        time.sleep(0.4)
+
+    # ==================== GRAFICI ====================
+    print("\n" + "=" * 80)
+    print(" RISULTATI SIMULAZIONE RULE-BASED")
+    print("=" * 80)
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Risultati Simulazione Rule-Based", fontsize=16)
+
+    axs[0, 0].plot(stats['cicli'], stats['temp_medie'], 'r-', label='Temp media')
+    axs[0, 0].plot(stats['cicli'], stats['temp_max'], 'r--', label='Temp max')
+    axs[0, 0].axhline(CONFIG["soglia_temp_alta"], color='orange', linestyle='--', label='Soglia Alta')
+    axs[0, 0].axhline(CONFIG["soglia_temp_critica"], color='darkred', linestyle='--', label='Soglia Critica')
+    axs[0, 0].set_title("Temperature")
+    axs[0, 0].legend()
+    axs[0, 0].grid(True)
+
+    axs[0, 1].plot(stats['cicli'], stats['soc_medio'], 'g-', label='SoC medio')
+    axs[0, 1].set_title("Stato di Carica Medio")
+    axs[0, 1].legend()
+    axs[0, 1].grid(True)
+
+    axs[1, 0].plot(stats['cicli'], stats['potenza_totale'], 'b-', label='Potenza erogata')
+    axs[1, 0].axhline(CONFIG["potenza_massima_stazione"], color='red', linestyle='--', label='Limite')
+    axs[1, 0].set_title("Potenza Totale")
+    axs[1, 0].legend()
+    axs[1, 0].grid(True)
+
+    axs[1, 1].bar(stats['cicli'], stats['fallimenti_raff'], color='purple', alpha=0.7)
+    axs[1, 1].set_title("Fallimenti Raffreddamento")
+    axs[1, 1].grid(True, axis='y')
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    if login():
+        avvia_stazione(num_colonnine=4)
